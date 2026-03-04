@@ -1,0 +1,28 @@
+version: "3.9"
+
+services:
+  sftp-source:
+    build: ./docker/sftp-server
+    container_name: sftp-source
+    ports:
+      - "2222:22"
+    environment:
+      SFTP_USERNAME: source_user
+      SFTP_PASSWORD: source_pass
+      SFTP_UID: 1001
+      SFTP_GID: 1001
+    volumes:
+      - ./data/source:/sftp/source_user/upload
+
+  sftp-target:
+    build: ./docker/sftp-server
+    container_name: sftp-target
+    ports:
+      - "2223:22"
+    environment:
+      SFTP_USERNAME: target_user
+      SFTP_PASSWORD: target_pass
+      SFTP_UID: 1002
+      SFTP_GID: 1002
+    volumes:
+      - ./data/target:/sftp/target_user/upload

@@ -1,0 +1,28 @@
+Port 22
+Protocol 2
+
+# Host keys (generated at container startup via ssh-keygen -A)
+HostKey /etc/ssh/ssh_host_rsa_key
+HostKey /etc/ssh/ssh_host_ecdsa_key
+HostKey /etc/ssh/ssh_host_ed25519_key
+
+PermitRootLogin no
+PasswordAuthentication yes
+PubkeyAuthentication yes
+ChallengeResponseAuthentication no
+UsePAM no
+X11Forwarding no
+AllowTcpForwarding no
+PermitTunnel no
+
+# SFTP subsystem
+Subsystem sftp internal-sftp
+
+# Restrict SFTP users
+Match Group sftpusers
+    ChrootDirectory /sftp/%u
+    ForceCommand internal-sftp
+    PasswordAuthentication yes
+    PubkeyAuthentication yes
+    X11Forwarding no
+    AllowTcpForwarding no
