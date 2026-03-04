@@ -1,0 +1,22 @@
+{
+  "sftp-source": {
+    "conn_type": "sftp",
+    "description": null,
+    "login": "source_user",
+    "password": "source_pass",
+    "host": "sftp-source",
+    "port": 22,
+    "schema": null,
+    "extra": null
+  },
+  "sftp-target": {
+    "conn_type": "sftp",
+    "description": null,
+    "login": "target_user",
+    "password": "target_pass",
+    "host": "sftp-target",
+    "port": 22,
+    "schema": null,
+    "extra": null
+  }
+}

@@ -36,7 +36,15 @@ docker compose -p local-sync -f docker-compose-sftp.yaml up -d --build
 ### 2) Start Airflow cluster
 
 ```bash
+# set AIRFLOW_UID to current user id for proper file permissions
+echo "AIRFLOW_UID=$(id -u)" > .env
+
 docker compose -p local-sync up -d
+```
+
+### 3) Import Airflow connections
+```bash
+docker compose -p local-sync run --rm airflow-cli airflow connections import --overwrite /opt/airflow/plugins/connections.json
 ```
 
 ### Stop services (optional)
