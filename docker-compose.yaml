@@ -312,6 +312,19 @@ services:
     depends_on:
       <<: *airflow-common-depends-on
 
+  airflow-python:
+    <<: *airflow-common
+    profiles:
+        - debug
+    environment:
+        <<: *airflow-common-env
+    user: "50000:0"
+    entrypoint: [ "/bin/bash", "-c" ]
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
   # You can enable flower by adding "--profile flower" option e.g. docker-compose --profile flower up
   # or by explicitly targeted on the command line e.g. docker-compose up flower.
   # See: https://docs.docker.com/compose/profiles/

@@ -7,7 +7,7 @@
     "host": "sftp-source",
     "port": 22,
     "schema": null,
-    "extra": null
+    "extra": "{\"no_host_key_check\": true}"
   },
   "sftp-target": {
     "conn_type": "sftp",
@@ -17,6 +17,6 @@
     "host": "sftp-target",
     "port": 22,
     "schema": null,
-    "extra": null
+    "extra": "{\"no_host_key_check\": true}"
   }
 }
