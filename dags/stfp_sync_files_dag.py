@@ -7,11 +7,11 @@ import tempfile
 from datetime import timedelta
 
 import pendulum
-from airflow import DAG
 from airflow.models import Variable
 from airflow.providers.sftp.hooks.sftp import SFTPHook
 from airflow.providers.sftp.sensors.sftp import SFTPSensor
 from airflow.sdk import dag, task
+from airflow.task.trigger_rule import TriggerRule
 
 # =========================
 # Config
@@ -36,6 +36,9 @@ STATE_VAR_KEY = "sftp_sync_state__source_to_target"
 
 POKE_INTERVAL = 30
 SENSOR_TIMEOUT = 60 * 60
+
+# Split threshold
+LARGE_FILE_THRESHOLD_BYTES = 100 * 1024 * 1024  # 100 MB
 
 
 # =========================
@@ -144,86 +147,111 @@ def sftp_sync_dag():
         deferrable=True,
     )
 
-    @task(task_id="sync_changed_files")
-    def sync_changed_files() -> dict:
+    @task(task_id="discover_changes")
+    def discover_changes() -> dict:
         """
-        One-way incremental sync:
-        - source -> target
-        - preserve directory structure
-        - no delete propagation
-        - copy new/updated files based on (size, mtime)
+        1) Load previous state
+        2) Scan source recursively
+        3) Build changed file list
+        4) Split into small/large lanes
         """
-        previous_state = Variable.get(
-            STATE_VAR_KEY,
-            default_var={},
-            deserialize_json=True,
-        )
+        previous_state = Variable.get(STATE_VAR_KEY, default_var={}, deserialize_json=True)
 
-        src_hook = SFTPHook(ssh_conn_id=SOURCE_CONN_ID)
-        tgt_hook = SFTPHook(ssh_conn_id=TARGET_CONN_ID)
-
-        src = src_hook.get_conn()
-        tgt = tgt_hook.get_conn()
-
-        # Current source snapshot (recursive)
+        src = SFTPHook(ssh_conn_id=SOURCE_CONN_ID).get_conn()
         current_state = _walk_sftp_files_recursive(src, SOURCE_ROOT)
 
-        copied = []
-        skipped = []
-        failed = []
+        small_files: list[dict] = []
+        large_files: list[dict] = []
 
         for source_path in sorted(current_state.keys()):
-            current_fp = current_state[source_path]
-            previous_fp = previous_state.get(source_path)
+            cur_fp = current_state[source_path]
+            prev_fp = previous_state.get(source_path)
 
-            # unchanged -> skip
-            if previous_fp == current_fp:
-                skipped.append(source_path)
-                continue
+            if prev_fp == cur_fp:
+                continue  # unchanged
 
-            target_path = _target_from_source(source_path)
+            item = {
+                "source_path": source_path,
+                "target_path": _target_from_source(source_path),
+                "size": cur_fp["size"],
+                "mtime": cur_fp["mtime"],
+            }
 
-            try:
-                _copy_one_file_via_temp(src, tgt, source_path, target_path)
-                copied.append({
-                    "source": source_path,
-                    "target": target_path,
-                    "size": current_fp["size"],
-                    "mtime": current_fp["mtime"],
-                })
-            except Exception as e:
-                failed.append({
-                    "source": source_path,
-                    "target": target_path,
-                    "error": str(e),
-                })
-
-        # IMPORTANT:
-        # - Do NOT delete on target when source file is deleted
-        # - Update state only if all changed files copied successfully
-        if failed:
-            raise RuntimeError(
-                f"SFTP sync failed for {len(failed)} file(s). "
-                f"copied={len(copied)}, skipped={len(skipped)}, failed={len(failed)}. "
-                f"sample_failed={failed[:5]}"
-            )
-
-        Variable.set(STATE_VAR_KEY, current_state, serialize_json=True)
+            if cur_fp["size"] >= LARGE_FILE_THRESHOLD_BYTES:
+                large_files.append(item)
+            else:
+                small_files.append(item)
 
         summary = {
-            "source_root": SOURCE_ROOT,
-            "target_root": TARGET_ROOT,
             "scanned_files": len(current_state),
-            "copied_files": len(copied),
-            "skipped_files": len(skipped),
-            "failed_files": len(failed),
-            "copied_examples": copied[:10],
-            "note": "One-way sync. No delete propagation.",
+            "changed_files": len(small_files) + len(large_files),
+            "small_files": len(small_files),
+            "large_files": len(large_files),
+            "threshold_bytes": LARGE_FILE_THRESHOLD_BYTES,
+            "note": "No delete propagation from source to target.",
         }
-        print(summary)
-        return summary
+        print({"discover_summary": summary})
 
-    wait_for_new_or_updated >> sync_changed_files()
+        return {
+            "current_state": current_state,
+            "small_files": small_files,
+            "large_files": large_files,
+            "summary": summary,
+        }
 
+    @task(
+        task_id="copy_small_file",
+        execution_timeout=timedelta(minutes=10),
+        retries=2,
+        retry_delay=timedelta(minutes=1),
+    )
+    def copy_small_file(item: dict) -> dict:
+        src = SFTPHook(ssh_conn_id=SOURCE_CONN_ID).get_conn()
+        tgt = SFTPHook(ssh_conn_id=TARGET_CONN_ID).get_conn()
+
+        _copy_one_file_via_temp(src, tgt, item["source_path"], item["target_path"])
+        return {"status": "copied", **item}
+
+    @task(
+        task_id="copy_large_file",
+        execution_timeout=timedelta(hours=2),
+        retries=3,
+        retry_delay=timedelta(minutes=5),
+    )
+    def copy_large_file(item: dict) -> dict:
+        src = SFTPHook(ssh_conn_id=SOURCE_CONN_ID).get_conn()
+        tgt = SFTPHook(ssh_conn_id=TARGET_CONN_ID).get_conn()
+
+        _copy_one_file_via_temp(src, tgt, item["source_path"], item["target_path"])
+        return {"status": "copied", **item}
+
+    @task(task_id="get_small_files")
+    def get_small_files(discovery: dict) -> list[dict]:
+        return discovery["small_files"]
+
+    @task(task_id="get_large_files")
+    def get_large_files(discovery: dict) -> list[dict]:
+        return discovery["large_files"]
+
+    @task(task_id="finalize_state", trigger_rule=TriggerRule.NONE_FAILED)
+    def finalize_state(discovery: dict) -> dict:
+        Variable.set(STATE_VAR_KEY, discovery["current_state"], serialize_json=True)
+        out = {**discovery["summary"], "state_updated": True}
+        print({"finalize_summary": out})
+        return out
+
+    discovery = discover_changes()
+
+    small_list = get_small_files(discovery)
+    large_list = get_large_files(discovery)
+
+    copied_small = copy_small_file.expand(item=small_list)
+    copied_large = copy_large_file.expand(item=large_list)
+
+    final = finalize_state(discovery)
+
+    wait_for_new_or_updated >> discovery
+    copied_small >> final
+    copied_large >> final
 
 dag = sftp_sync_dag()
