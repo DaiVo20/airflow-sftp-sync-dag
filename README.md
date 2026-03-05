@@ -50,8 +50,8 @@ docker compose -p local-sync run --rm airflow-cli airflow connections import --o
 ### Stop services (optional)
 
 ```bash
-docker compose -p local-sync down
 docker compose -p local-sync -f docker-compose-sftp.yaml down
+docker compose -p local-sync down
 ```
 ---
 
@@ -64,6 +64,70 @@ The DAG follows this general flow:
 3. Create missing directories on target
 4. Transfer files from source to target while preserving the original path
 5. Skip deletion logic (target retains files even if removed from source)
+
+
+---
+
+
+## Local Utility Scripts (uv)
+
+This repository includes local utility scripts (e.g. test file generation) that can be run with [`uv`](https://docs.astral.sh/uv/).
+
+### Setup `uv` (with standalone installers)
+```bash
+# On macOS and Linux.
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+```bash
+# On Windows.
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+Or, from [PyPI](https://pypi.org/project/uv/):
+
+```bash
+
+### Create a local Python environment
+
+```bash
+uv venv
+```
+
+Activate it (optional):
+
+```bash
+source .venv/bin/activate
+```
+
+> The current utility script (`scripts/generate_test_files.py`) uses only Python standard library, so no additional dependencies are required.
+
+### Run the test file generator with `uv`
+
+Generate sample files in `data/source/a/b/c` (default behavior):
+
+```bash
+uv run scripts/generate_test_files.py
+```
+
+### Example: customize generated files
+
+Generate more small files and multiple large files (~100MB each):
+
+```bash
+uv run scripts/generate_test_files.py --small-count 10 --large-count 2 --large-base-mb 100 --large-jitter-mb 5
+```
+
+Generate files in a custom subdirectory:
+
+```bash
+uv run scripts/generate_test_files.py --root data/source --subdir incoming/2026/03/05
+```
+
+### Notes
+
+- These scripts are intended for **local testing/debugging** only.
+- They are kept outside the Airflow DAG to keep the DAG focused on the SFTP sync workflow.
 
 ---
 

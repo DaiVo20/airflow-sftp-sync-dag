@@ -1,0 +1,8 @@
+[project]
+name = "airflow-sftp-sync-dag"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "cryptography>=46.0.5",
+    "pip>=26.0.1",
+]
