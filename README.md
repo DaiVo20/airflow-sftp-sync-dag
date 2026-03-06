@@ -21,7 +21,27 @@ The DAG copies files from **source** to **target** while preserving the original
 
 
 ## Setup Infrastructure (Airflow + 2 SFTP Servers)
+### Airflow Runtime
+- Airflow image: `apache/airflow:3.1.7` (pin for reproducibility)
+- Executor: CeleryExecutor
+- Metadata DB: PostgreSQL (SQLite is permissible, but Postgres is used for better concurrency support)
+- Broker: Redis (for Celery task queue) but can be swapped with RabbitMQ for heavier workloads
 
+### DAG Configuration
+- DAG ID: `sftp_sync_dag`
+- Airflow Connections:
+  - `sftp_source` (Host: `sftp-source`, Port: 22)
+  - `sftp_target` (Host: `sftp-target`, Port: 22)
+- Sync roots:
+  - Source root: `/upload`
+  - Target root: `/upload`
+- Sync state: stored in Airflow Variables (see `sftp_sync_state__source_to_target` in DAG) to track last known file states for idempotency and change detection. In production, a more robust external state store (e.g. Redis, Postgres) may be preferable.
+
+### Local SFTP Notes
+For local development, you may disable host key checking via Connection Extra:
+`{"no_host_key_check": true}`
+
+### Docker Compose Setup
 This project uses two Docker Compose files:
 
 - `docker-compose-sftp.yaml` for local SFTP source/target servers

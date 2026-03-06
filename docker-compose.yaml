@@ -89,6 +89,83 @@ x-airflow-common:
       condition: service_healthy
 
 services:
+  minio:
+    image: minio/minio:RELEASE.2024-12-13T22-19-12Z
+    container_name: minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"  # S3 API
+      - "9001:9001"  # MinIO Console
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - ./data/minio:/data
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-05-21T01-59-54Z-cpuv1
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        echo "Waiting for MinIO...";
+        until mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"; do sleep 2; done;
+    
+        # fail fast if not admin/root
+        mc admin info local;
+    
+        # create bucket (idempotent)
+        mc mb -p "local/$$MINIO_BUCKET" || true;
+    
+        # create a bucket-scoped policy (only this bucket + objects)
+        cat > /tmp/bucket-policy.json <<EOF
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
+              "Resource": ["arn:aws:s3:::$$MINIO_BUCKET"]
+            },
+            {
+              "Effect": "Allow",
+              "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+              "Resource": ["arn:aws:s3:::$$MINIO_BUCKET/*"]
+            }
+          ]
+        }
+        EOF
+    
+    
+        # create a dedicated access key for that user scoped by the policy
+        mc admin accesskey create local/"$$MINIO_ROOT_USER" \
+          --access-key "$$MINIO_APP_ACCESS_KEY" \
+          --secret-key "$$MINIO_APP_SECRET_KEY" \
+          --policy /tmp/bucket-policy.json;
+    
+        echo "MinIO bucket ready: $$MINIO_BUCKET";
+        echo "App access key: $$MINIO_APP_ACCESS_KEY";
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-sftp-sync}
+
+      # deterministic credentials for Airflow AWS connection
+      MINIO_APP_ACCESS_KEY: ${MINIO_APP_ACCESS_KEY:-airflowaccesskey}
+      MINIO_APP_SECRET_KEY: ${MINIO_APP_SECRET_KEY:-airflowsecretkey}
+
+
   postgres:
     image: postgres:16
     environment:

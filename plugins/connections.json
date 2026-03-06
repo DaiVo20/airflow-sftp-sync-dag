@@ -18,5 +18,14 @@
     "port": 22,
     "schema": null,
     "extra": "{\"no_host_key_check\": true}"
+  },
+    "aws_minio": {
+    "conn_type": "aws",
+    "host": null,
+    "login": null,
+    "password": null,
+    "schema": null,
+    "port": null,
+    "extra": "{ \"aws_access_key_id\": \"airflowaccesskey\", \"aws_secret_access_key\": \"airflowaccesskey\", \"endpoint_url\": \"http://minio:9000\"}"
   }
 }
