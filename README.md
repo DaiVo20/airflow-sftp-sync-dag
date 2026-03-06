@@ -28,7 +28,7 @@ The DAG copies files from **source** to **target** while preserving the original
 - Broker: Redis (for Celery task queue) but can be swapped with RabbitMQ for heavier workloads
 
 ### DAG Configuration
-- DAG ID: `sftp_sync_dag`
+- DAG ID: `sftp_sync_files_dag`
 - Airflow Connections:
   - `sftp-source` (Host: `sftp-source`, Port: 22)
   - `sftp-target` (Host: `sftp-target`, Port: 22)
