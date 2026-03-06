@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import os
 import posixpath
 import stat as statmod
-import tempfile
 from datetime import timedelta
 
 import pendulum
@@ -13,25 +11,30 @@ from airflow.providers.sftp.sensors.sftp import SFTPSensor
 from airflow.sdk import dag, task
 from airflow.task.trigger_rule import TriggerRule
 
+from target_storage.storage_targets import TargetKind, TargetConfig, build_target
+
 # =========================
 # Config
 # =========================
 DAG_ID = "sftp_sync_files_dag"
 
 DEFAULT_ARGS = {
-    "owner": "airflow",
+    "owner": "Dai Vo",
     "retries": 2,
     "retry_delay": timedelta(minutes=1),
 }
 
-# Root sync directory on each SFTP server
-SOURCE_ROOT = "/upload"
-TARGET_ROOT = "/upload"
-
 SOURCE_CONN_ID = "sftp-source"
-TARGET_CONN_ID = "sftp-target"
+# Root sync directory on each SFTP server
+SOURCE_SFTP_ROOT = "/upload"
 
-# Persist source snapshot (for incremental detection)
+TARGET_SFTP_ROOT = "/upload"
+TARGET_SFTP_CONN_ID = "sftp-target"  # used when target_kind = "sftp"
+
+AWS_CONN_ID_DEFAULT = "aws_default"  # used when target_kind = "s3"
+SYNC_S3_BUCKET = "sftp-sync"  # used when target_kind = "s3"
+SYNC_S3_PREFIX = ""  # used when target_kind = "s3"
+
 STATE_VAR_KEY = "sftp_sync_state__source_to_target"
 
 POKE_INTERVAL = 30
@@ -54,29 +57,6 @@ def _is_under(root: str, path: str) -> bool:
     return path_n == root_n or path_n.startswith(root_n + "/")
 
 
-def _target_from_source(source_path: str) -> str:
-    rel_path = posixpath.relpath(_norm(source_path), _norm(SOURCE_ROOT))
-    return _norm(posixpath.join(TARGET_ROOT, rel_path))
-
-
-def _mkdir_p_sftp(sftp_client, remote_dir: str) -> None:
-    """Recursively create directory on target SFTP."""
-    remote_dir = _norm(remote_dir)
-    if remote_dir in ("", "/"):
-        return
-
-    parts = remote_dir.strip("/").split("/")
-    cur = "/"
-    for part in parts:
-        cur = posixpath.join(cur, part)
-        try:
-            st = sftp_client.stat(cur)
-            if not statmod.S_ISDIR(st.st_mode):
-                raise RuntimeError(f"Target path exists but is not a directory: {cur}")
-        except FileNotFoundError:
-            sftp_client.mkdir(cur)
-
-
 def _walk_sftp_files_recursive(sftp_client, root: str) -> dict[str, dict[str, int]]:
     """
     Recursively scan files under root and return snapshot:
@@ -92,33 +72,48 @@ def _walk_sftp_files_recursive(sftp_client, root: str) -> dict[str, dict[str, in
             child_path = _norm(posixpath.join(dir_path, attr.filename))
             if statmod.S_ISDIR(attr.st_mode):
                 _walk(child_path)
-            elif statmod.S_ISREG(attr.st_mode):
-                if _is_under(root, child_path):
-                    snapshot[child_path] = {
-                        "size": int(attr.st_size),
-                        "mtime": int(attr.st_mtime),
-                    }
+            elif statmod.S_ISREG(attr.st_mode) and _is_under(root, child_path):
+                snapshot[child_path] = {
+                    "size": int(attr.st_size),
+                    "mtime": int(attr.st_mtime),
+                }
 
     _walk(root)
     return snapshot
 
 
-def _copy_one_file_via_temp(src_sftp_client, tgt_sftp_client, source_path: str, target_path: str) -> None:
+def _build_target_from_variables(target_kind: TargetKind):
     """
-    Copy source SFTP file -> target SFTP via local temp file.
-    Disk-spooled approach avoids loading entire file into memory.
+    Creates and returns a target storage backend (SFTP or S3) based on the specified
+    target_kind parameter. Configuration values are retrieved from Airflow variables
+    and constants defined at the module level.
+
+    Supports two target types:
+    - SFTP: Syncs files to a remote SFTP server using SSH connection credentials
+    - S3: Syncs files to an AWS S3 bucket using AWS connection credentials
+
+    Args:
+        target_kind (TargetKind): Enum value specifying the target type (SFTP or S3)
+
+    Returns:
+        StorageTarget: An initialized target instance (SFTPTarget or S3Target) ready
+                       to accept file uploads via the put_stream() method
+
+    Raises:
+        ValueError: If target_kind is not a valid TargetKind enum value
     """
-    _mkdir_p_sftp(tgt_sftp_client, posixpath.dirname(target_path))
 
-    fd, tmp_path = tempfile.mkstemp(prefix="sftp_sync_", suffix=".tmp")
-    os.close(fd)
-
-    try:
-        src_sftp_client.get(source_path, tmp_path)
-        tgt_sftp_client.put(tmp_path, target_path, confirm=True)
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+    cfg = TargetConfig(
+        kind=target_kind,
+        # SFTP target
+        sftp_conn_id=TARGET_SFTP_CONN_ID,
+        sftp_root=TARGET_SFTP_ROOT,
+        # S3 target
+        aws_conn_id=AWS_CONN_ID_DEFAULT,
+        s3_bucket=SYNC_S3_BUCKET,
+        s3_prefix=SYNC_S3_PREFIX,
+    )
+    return build_target(cfg)
 
 
 # =========================
@@ -126,10 +121,10 @@ def _copy_one_file_via_temp(src_sftp_client, tgt_sftp_client, source_path: str, 
 # =========================
 @dag(
     dag_id=DAG_ID,
-    description="One-way SFTP-to-SFTP sync (single flow) with preserved directory structure",
+    description="One-way sync from SFTP source to pluggable target (SFTP or S3), with small/large lanes",
     schedule=None,
     start_date=pendulum.datetime(2026, 3, 5, tz="Asia/Ho_Chi_Minh"),
-    catchup=True,
+    catchup=False,
     max_active_runs=1,
     default_args=DEFAULT_ARGS,
     tags=["sftp", "sync"],
@@ -140,7 +135,7 @@ def sftp_sync_dag():
     wait_for_new_or_updated = SFTPSensor(
         task_id="wait_for_new_or_updated",
         sftp_conn_id=SOURCE_CONN_ID,
-        path=SOURCE_ROOT,
+        path=SOURCE_SFTP_ROOT,
         file_pattern="*",
         poke_interval=POKE_INTERVAL,
         timeout=SENSOR_TIMEOUT,
@@ -150,15 +145,13 @@ def sftp_sync_dag():
     @task(task_id="discover_changes")
     def discover_changes() -> dict:
         """
-        1) Load previous state
-        2) Scan source recursively
-        3) Build changed file list
-        4) Split into small/large lanes
+        Scan source recursively, compute changed files (size+mtime),
+        then split into small/large lanes. No delete propagation by design.
         """
         previous_state = Variable.get(STATE_VAR_KEY, default_var={}, deserialize_json=True)
 
         src = SFTPHook(ssh_conn_id=SOURCE_CONN_ID).get_conn()
-        current_state = _walk_sftp_files_recursive(src, SOURCE_ROOT)
+        current_state = _walk_sftp_files_recursive(src, SOURCE_SFTP_ROOT)
 
         small_files: list[dict] = []
         large_files: list[dict] = []
@@ -170,9 +163,11 @@ def sftp_sync_dag():
             if prev_fp == cur_fp:
                 continue  # unchanged
 
+            rel_path = posixpath.relpath(_norm(source_path), _norm(SOURCE_SFTP_ROOT))
+
             item = {
                 "source_path": source_path,
-                "target_path": _target_from_source(source_path),
+                "rel_path": rel_path,
                 "size": cur_fp["size"],
                 "mtime": cur_fp["mtime"],
             }
@@ -199,32 +194,6 @@ def sftp_sync_dag():
             "summary": summary,
         }
 
-    @task(
-        task_id="copy_small_file",
-        execution_timeout=timedelta(minutes=10),
-        retries=2,
-        retry_delay=timedelta(minutes=1),
-    )
-    def copy_small_file(item: dict) -> dict:
-        src = SFTPHook(ssh_conn_id=SOURCE_CONN_ID).get_conn()
-        tgt = SFTPHook(ssh_conn_id=TARGET_CONN_ID).get_conn()
-
-        _copy_one_file_via_temp(src, tgt, item["source_path"], item["target_path"])
-        return {"status": "copied", **item}
-
-    @task(
-        task_id="copy_large_file",
-        execution_timeout=timedelta(hours=2),
-        retries=3,
-        retry_delay=timedelta(minutes=5),
-    )
-    def copy_large_file(item: dict) -> dict:
-        src = SFTPHook(ssh_conn_id=SOURCE_CONN_ID).get_conn()
-        tgt = SFTPHook(ssh_conn_id=TARGET_CONN_ID).get_conn()
-
-        _copy_one_file_via_temp(src, tgt, item["source_path"], item["target_path"])
-        return {"status": "copied", **item}
-
     @task(task_id="get_small_files")
     def get_small_files(discovery: dict) -> list[dict]:
         return discovery["small_files"]
@@ -233,8 +202,46 @@ def sftp_sync_dag():
     def get_large_files(discovery: dict) -> list[dict]:
         return discovery["large_files"]
 
+    @task(
+        task_id="copy_small_file",
+        pool="sftp_small_pool",
+        execution_timeout=timedelta(minutes=10),
+        retries=2,
+        retry_delay=timedelta(minutes=1),
+    )
+    def copy_small_file(item: dict) -> dict:
+        src = SFTPHook(ssh_conn_id=SOURCE_CONN_ID).get_conn()
+        target = _build_target_from_variables(TargetKind.SFTP)
+
+        with src.open(item["source_path"], "rb") as stream:
+            target.put_stream(item["rel_path"], stream, size=int(item["size"]))
+
+        dest = target.dest_ref(item["rel_path"]).identifier
+        return {"status": "copied", "dest": dest, **item}
+
+    @task(
+        task_id="copy_large_file",
+        pool="sftp_large_pool",
+        execution_timeout=timedelta(hours=2),
+        retries=3,
+        retry_delay=timedelta(minutes=5),
+    )
+    def copy_large_file(item: dict) -> dict:
+        src = SFTPHook(ssh_conn_id=SOURCE_CONN_ID).get_conn()
+        target = _build_target_from_variables(TargetKind.SFTP)
+
+        with src.open(item["source_path"], "rb") as stream:
+            target.put_stream(item["rel_path"], stream, size=int(item["size"]))
+
+        dest = target.dest_ref(item["rel_path"]).identifier
+        return {"status": "copied", "dest": dest, **item}
+
     @task(task_id="finalize_state", trigger_rule=TriggerRule.NONE_FAILED)
     def finalize_state(discovery: dict) -> dict:
+        """
+        Update state only if no upstream failures.
+        Works even if mapped lanes are empty (skipped).
+        """
         Variable.set(STATE_VAR_KEY, discovery["current_state"], serialize_json=True)
         out = {**discovery["summary"], "state_updated": True}
         print({"finalize_summary": out})

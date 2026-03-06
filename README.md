@@ -49,8 +49,8 @@ docker compose -p local-sync run --rm airflow-cli airflow connections import --o
 
 ### 4) Create pool for small and large files transfers
 ```bash
-docker compose -p local-sync run --rm airflow-cli airflow pools set sftp_small_pool 16 "High concurrency for small files" 
-docker compose -p local-sync run --rm airflow-cli airflow pools set sftp_small_pool 4 "High concurrency for small files" 
+docker compose -p local-sync run --rm airflow-cli airflow pools set sftp_small_pool 32 "High concurrency for small files" 
+docker compose -p local-sync run --rm airflow-cli airflow pools set sftp_large_pool 8 "High concurrency for large files" 
 ```
 
 ### Stop services (optional)
@@ -89,8 +89,6 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 # On Windows.
 powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
-
-Or, from [PyPI](https://pypi.org/project/uv/):
 
 ### Create a local Python environment
 
