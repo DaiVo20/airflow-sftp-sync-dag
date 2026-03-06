@@ -30,8 +30,8 @@ The DAG copies files from **source** to **target** while preserving the original
 ### DAG Configuration
 - DAG ID: `sftp_sync_dag`
 - Airflow Connections:
-  - `sftp_source` (Host: `sftp-source`, Port: 22)
-  - `sftp_target` (Host: `sftp-target`, Port: 22)
+  - `sftp-source` (Host: `sftp-source`, Port: 22)
+  - `sftp-target` (Host: `sftp-target`, Port: 22)
 - Sync roots:
   - Source root: `/upload`
   - Target root: `/upload`
@@ -165,15 +165,86 @@ uv run scripts/generate_test_files.py --root data/source --subdir incoming/2026/
 
 ## Design Decisions & Trade-offs
 
-### 1) One-way synchronization
-This directly matches the problem statement and avoids unnecessary bidirectional conflict handling.
+### 1) One-way synchronization (source ➜ target only)
+**Decision:** The DAG is intentionally **unidirectional**. Changes made on the target do not affect the source, and deletions on the source are not propagated to the target.  
+**Why:** This matches the assignment requirements and simplifies conflict handling (no bidirectional reconciliation).  
+**Trade-off:** Target can diverge from source if manually modified; this is acceptable by design.
 
-### 2) Preserve directory structure
-Using relative path mapping keeps the behavior deterministic and easy to reason about.
+### 2) Preserve directory structure using relative path mapping
+**Decision:** The DAG computes a `rel_path` from `SOURCE_ROOT` and writes to the target using the same relative path.  
+**Why:** This guarantees deterministic placement and makes verification simple (path is the contract).  
+**Trade-off:** Any change in source root definition changes the mapping; therefore `SOURCE_ROOT` is treated as a stable configuration boundary.
 
-### 3) Extensibility-oriented design
-The implementation should separate concerns (listing, transfer, path mapping, state handling) so future changes (e.g. SFTP -> Object Storage) are easier to support.
+### 3) Incremental sync using metadata snapshot (size + mtime)
+**Decision:** The workflow tracks a snapshot of files on the source (path ➜ `{size, mtime}`) and only transfers files that are new or have changed. Snapshot state is stored in **Airflow Variables**.  
+**Why:** This keeps the solution lightweight and avoids hashing every file on every run, while still enabling incremental behavior.  
+**Trade-off:** Metadata comparison is not as strict as checksums (rare edge cases exist where content changes without metadata differences). For stricter integrity, checksum verification can be added for selected files (e.g., large files only).
 
-### 4) Scalability considerations
-For larger files (KB -> GB growth), streaming/chunked transfer is preferable to loading entire files into memory.
+### 4) Sensor as a gate; authoritative discovery in a Python task
+**Decision:** `SFTPSensor` is used as a **polling gate**, while the recursive scan and diffing are done in a dedicated discovery task.  
+**Why:** Sensors are good for scheduling/polling, but the required behavior (recursive traversal + incremental diff + lane split) is better controlled explicitly in code.  
+**Trade-off:** This introduces an extra scan step in the DAG, but it keeps behavior consistent and debuggable.
 
+### 5) Split processing into small-file and large-file lanes (resource-aware orchestration)
+**Decision:** Changed files are partitioned into **small** and **large** lanes based on a size threshold. Each lane uses different pools/timeouts/retries.  
+**Why:** This is a scalable strategy when file sizes grow from KB to GB:
+- small files can run with higher concurrency
+- large files should be throttled to avoid saturating bandwidth/disk and to reduce blast radius on failures  
+**Trade-off:** More orchestration complexity (two mapped tasks + pools), but improved operational safety and clearer scaling knobs.
+
+### 6) Disk-spooled transfers to avoid memory pressure
+**Decision:** File transfers are performed using a **stream ➜ temporary local file ➜ upload** approach.  
+**Why:** This prevents loading entire files into memory, which is critical when files become large.  
+**Trade-off:** Requires temporary disk space on workers; for very large files, disk sizing and cleanup become operational considerations.
+
+### 7) State finalization only after successful transfers
+**Decision:** The state snapshot is updated only after all file transfer tasks complete successfully.  
+**Why:** Prevents marking files as “synced” when a transfer fails midway; supports safe retries by reprocessing unresolved items in the next run.  
+**Trade-off:** A single failing large file can delay state advancement for that run, which is preferable to silently skipping data.
+
+### 8) Extensibility via Target Storage abstraction
+**Decision:** Target write operations are abstracted behind a `TargetStorage` interface with an enum-like selector (`TargetKind`).  
+**Why:** This makes the solution adaptable if the target changes from **SFTP ➜ Object Storage (S3/MinIO)** without rewriting the DAG’s orchestration logic.  
+**Trade-off:** Additional code structure (adapters/factory), but significantly improved adaptability and testability.
+
+### 9) Transformation-friendly architecture
+**Decision:** The pipeline is structured as discover ➜ plan ➜ transfer ➜ finalize.  
+**Why:** This enables inserting optional transformations between “read” and “write” (validation, rename, compression, encryption, etc.) without changing the discovery/state logic.  
+**Trade-off:** Slightly more boilerplate than a single monolithic task, but improves maintainability.
+
+### 10) Handling anomalies and scale changes (KB ➜ GB)
+**Decision:** The design favors throttling and robustness over raw throughput:
+- dedicated pools for large files
+- longer timeouts and retries for large transfers
+- disk-spooled approach to avoid memory spikes  
+**Trade-off:** Lower peak throughput for very large files, but predictable performance and fewer operational surprises.
+
+## Future Improvements (Large File Scale: KB ➜ GB)
+
+### 1) Multipart upload tuning for S3 / MinIO
+For large files, S3-compatible backends typically use multipart upload. The following tuning knobs can improve throughput and reliability depending on network and worker resources:
+
+- **`multipart_threshold`**: size threshold to start multipart uploads (e.g., 16–64 MB).
+- **`multipart_chunksize`**: part size (e.g., 8–64 MB). Larger parts reduce request overhead; smaller parts improve retry granularity.
+- **`max_concurrency`**: number of parallel part uploads. This should be balanced with worker bandwidth and the large-file pool size.
+- **Retry strategy**: multipart enables retrying failed parts instead of re-uploading the entire object.
+
+In Airflow, these settings can be applied via boto3 transfer configuration (e.g., `TransferConfig`) or hook/operator parameters when available, so behavior can be tuned without changing DAG orchestration.
+
+### 2) File stability check (avoid copying files still being written)
+When files are large, there is a higher chance the file is still being uploaded to the source SFTP while the DAG scans it. A stability check reduces partial transfers:
+
+- **Two-pass metadata check**: record `(size, mtime)` for candidates, sleep for a short window (e.g., 30–60s), re-check. Only transfer if unchanged.
+- **Minimum age threshold**: only transfer files with `mtime <= now - N minutes`.
+- **Optional marker file convention**: if upstream can create `.done` markers, only transfer files with corresponding completion markers.
+
+This prevents copying incomplete files and reduces wasted network/compute.
+
+### 3) Resume support for interrupted large transfers
+For GB-scale files, retries may be expensive if re-transfer always starts from byte 0. Resume support improves robustness:
+
+- **S3/MinIO target**: multipart upload already supports part-level retries; the pipeline can persist upload state (upload ID / completed parts) for recovery.
+- **SFTP target**: write to a temporary file (e.g., `file.tmp`) and resume from the last byte offset if the server supports appending, then atomically rename to the final name.
+- **State tracking**: persist transfer progress metadata (e.g., bytes completed, last successful part) in an external store (DB/table/Redis) to allow safe continuation across task retries or reruns.
+
+Resume support would be applied only to the large-file lane to keep small-file handling simple and fast.

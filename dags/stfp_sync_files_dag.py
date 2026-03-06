@@ -122,7 +122,7 @@ def _build_target_from_variables(target_kind: TargetKind):
 @dag(
     dag_id=DAG_ID,
     description="One-way sync from SFTP source to pluggable target (SFTP or S3), with small/large lanes",
-    schedule=None,
+    schedule="@hourly",
     start_date=pendulum.datetime(2026, 3, 5, tz="Asia/Ho_Chi_Minh"),
     catchup=False,
     max_active_runs=1,
